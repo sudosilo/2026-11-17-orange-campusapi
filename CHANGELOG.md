@@ -1,0 +1,1 @@
+2026-11-17, v2026.11.17. Created Campus API, the backend for Campus. Added curated sources, course loading in order, the end of video log, and the transcript with credits. The database can now live on a persistent volume.
