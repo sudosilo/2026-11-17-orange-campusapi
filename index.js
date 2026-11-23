@@ -25,6 +25,27 @@ const DB_PATH                  = process.env.DB_FILE || path.join(__dirname, 'ca
 const YT_KEY                   = process.env.YOUTUBE_API_KEY;
 // Ceiling raised from 1000 so real lessons can surface in stumble mode.
 const MAX_VIEWS                = 100000;
+// YouTube category ids. Lessons come from the first set; the second set only
+// fills in when the first comes up short. Gaming, music, comedy, sports and
+// film never show up.
+const EDU_CATEGORIES   = new Set(['26', '27', '28', '25']);   // howto, education, science and tech, news
+const BACKUP_CATEGORIES = new Set(['19', '22', '2', '15']);   // travel, people and blogs, autos, animals
+const MIN_SECONDS      = 180;                                 // drops shorts and clips under 3 minutes
+
+function isoSeconds(iso) {
+  const m = String(iso || '').match(/P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  return (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+(m[3] || 0)) * 60 + (+(m[4] || 0));
+}
+function cleanProfileName(p) { return String(p || 'default').trim().toLowerCase() || 'default'; }
+function junkFor(profile) {
+  const stmt = db.prepare('SELECT video_id, channel_id FROM junk WHERE profile = ?');
+  stmt.bind([profile]);
+  const videos = new Set(), channels = new Set();
+  while (stmt.step()) { const r = stmt.getAsObject(); videos.add(r.video_id); if (r.channel_id) channels.add(r.channel_id); }
+  stmt.free();
+  return { videos, channels };
+}
 const MAX_SUBS                 = 100000;
 const FETCH_N                  = 50;
 const REVISIT_MIN_HOURS        = 24;
@@ -111,6 +132,17 @@ async function initDb() {
   try { db.run('ALTER TABLE entries ADD COLUMN profile TEXT'); } catch (e) {}
   // Genre columns. Same safe pattern: added when missing, ignored when present.
   try { db.run('ALTER TABLE entries ADD COLUMN genre TEXT'); } catch (e) {}
+  // The subject you were studying when you logged it. Recommendations search this, never the bucket name.
+  try { db.run('ALTER TABLE entries ADD COLUMN subject TEXT'); } catch (e) {}
+  // Junk: videos and channels a profile threw out. Search never serves them to that profile again.
+  db.run(`CREATE TABLE IF NOT EXISTS junk (
+    profile    TEXT NOT NULL,
+    video_id   TEXT NOT NULL,
+    channel_id TEXT,
+    title      TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (profile, video_id)
+  )`);
   try { db.run('ALTER TABLE sources ADD COLUMN genre TEXT'); } catch (e) {}
   saveDb();
 }
@@ -278,7 +310,11 @@ app.get('/search', async (req, res) => {
     searchUrl.searchParams.set('part',       'snippet');
     searchUrl.searchParams.set('type',       'video');
     searchUrl.searchParams.set('maxResults', String(FETCH_N));
-    searchUrl.searchParams.set('order',      'date');
+    // Campus wants the best lesson for the subject, so relevance, embeddable, English first.
+    searchUrl.searchParams.set('order',      'relevance');
+    searchUrl.searchParams.set('videoEmbeddable', 'true');
+    searchUrl.searchParams.set('relevanceLanguage', 'en');
+    searchUrl.searchParams.set('safeSearch', 'moderate');
     searchUrl.searchParams.set('key',        YT_KEY);
     if (q) searchUrl.searchParams.set('q', q);
     if (lat && lng) {
@@ -294,7 +330,8 @@ app.get('/search', async (req, res) => {
     if (videoIds.length === 0) return res.json({ videos: [], location: chosenLocation });
 
     const seen     = getSeenSet();
-    const freshIds = videoIds.filter(id => !seen.has(id));
+    const junk     = junkFor(cleanProfileName(req.query.profile));
+    const freshIds = videoIds.filter(id => !seen.has(id) && !junk.videos.has(id));
     if (freshIds.length === 0) return res.json({ videos: [], location: chosenLocation });
 
     const videoUrl = new URL('https://www.googleapis.com/youtube/v3/videos');
@@ -304,7 +341,15 @@ app.get('/search', async (req, res) => {
     const videoResp = await fetch(videoUrl);
     const videoData = await videoResp.json();
 
-    const englishVideos = (videoData.items || []).filter(isLikelyEnglish);
+    // Keep long enough lessons in learning categories, skip junked channels.
+    const usable = (videoData.items || []).filter(v =>
+      isLikelyEnglish(v) &&
+      !junk.channels.has(v.snippet.channelId) &&
+      isoSeconds(v.contentDetails && v.contentDetails.duration) >= MIN_SECONDS);
+    let englishVideos = usable.filter(v => EDU_CATEGORIES.has(String(v.snippet.categoryId)));
+    if (englishVideos.length < 3) {
+      englishVideos = englishVideos.concat(usable.filter(v => BACKUP_CATEGORIES.has(String(v.snippet.categoryId))));
+    }
     if (englishVideos.length === 0) {
       return res.json({ videos: [], location: chosenLocation });
     }
@@ -329,6 +374,7 @@ app.get('/search', async (req, res) => {
       id: v.id, title: v.snippet.title, channel: v.snippet.channelTitle,
       channel_id: v.snippet.channelId, published: v.snippet.publishedAt,
       duration: v.contentDetails.duration,
+      category: v.snippet.categoryId,
       views: parseInt(v.statistics.viewCount || '0', 10),
       subs: subsByChannel[v.snippet.channelId] || 0,
       thumbnail: v.snippet.thumbnails.medium?.url,
@@ -584,7 +630,7 @@ app.get('/course', async (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.post('/entry', (req, res) => {
-  const { video_id, title, channel, bucket, status, note, project_link, source_kind, profile } = req.body;
+  const { video_id, title, channel, bucket, status, note, project_link, source_kind, profile, subject } = req.body;
   if (!video_id) return res.status(400).json({ error: 'video_id required' });
   const cleanBucket = String(bucket || '').trim().toLowerCase();
   if (!cleanBucket) return res.status(400).json({ error: 'bucket required' });
@@ -593,10 +639,10 @@ app.post('/entry', (req, res) => {
   const genre = cleanGenre(req.body.genre, 'general');
 
   db.run(
-    `INSERT INTO entries (video_id, title, channel, bucket, status, note, project_link, source_kind, profile, genre, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO entries (video_id, title, channel, bucket, status, note, project_link, source_kind, profile, genre, subject, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [video_id, title || null, channel || null, cleanBucket, cleanStatus,
-     (note || '').trim() || null, (project_link || '').trim() || null, source_kind || null, cleanProfile, genre, Date.now()]
+     (note || '').trim() || null, (project_link || '').trim() || null, source_kind || null, cleanProfile, genre, (subject || '').trim().toLowerCase() || null, Date.now()]
   );
   saveDb();
   res.json({ ok: true, bucket: cleanBucket, status: cleanStatus, profile: cleanProfile, genre });
@@ -663,7 +709,7 @@ app.get('/entries', (req, res) => {
   const profile = String(req.query.profile || 'default').trim().toLowerCase() || 'default';
   const bucket = (req.query.bucket || '').trim().toLowerCase();
   const genreFilter = cleanGenre(req.query.genre, '');
-  let sql = "SELECT id, video_id, title, channel, bucket, status, note, project_link, COALESCE(genre, 'general') AS genre, created_at FROM entries WHERE COALESCE(profile, 'default') = ?";
+  let sql = "SELECT id, video_id, title, channel, bucket, status, note, project_link, COALESCE(genre, 'general') AS genre, subject, created_at FROM entries WHERE COALESCE(profile, 'default') = ?";
   const params = [profile];
   if (bucket) { sql += ' AND bucket = ?'; params.push(bucket); }
   if (genreFilter) { sql += " AND COALESCE(genre, 'general') = ?"; params.push(genreFilter); }
@@ -674,6 +720,27 @@ app.get('/entries', (req, res) => {
   while (stmt.step()) entries.push(stmt.getAsObject());
   stmt.free();
   res.json({ profile, bucket: bucket || 'all', genre: genreFilter || 'all', count: entries.length, entries });
+});
+
+// Junk: throw out a video so search never serves it, or its channel, to this profile again.
+app.post('/junk', (req, res) => {
+  const { video_id, channel_id, title } = req.body;
+  if (!video_id) return res.status(400).json({ error: 'video_id required' });
+  const profile = cleanProfileName(req.body.profile);
+  db.run('INSERT OR REPLACE INTO junk (profile, video_id, channel_id, title, created_at) VALUES (?, ?, ?, ?, ?)',
+    [profile, video_id, channel_id || null, title || null, Date.now()]);
+  saveDb();
+  res.json({ ok: true, profile, video_id });
+});
+
+app.get('/junk', (req, res) => {
+  const profile = cleanProfileName(req.query.profile);
+  const stmt = db.prepare('SELECT video_id, channel_id, title, created_at FROM junk WHERE profile = ? ORDER BY created_at DESC');
+  stmt.bind([profile]);
+  const junk = [];
+  while (stmt.step()) junk.push(stmt.getAsObject());
+  stmt.free();
+  res.json({ profile, count: junk.length, junk });
 });
 
 const PORT = process.env.PORT || 3000;
